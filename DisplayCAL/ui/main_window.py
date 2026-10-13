@@ -297,7 +297,7 @@ from DisplayCAL.worker import (
 )
 
 if TYPE_CHECKING:
-    from qtpy.QtGui import QPaintEvent, QShowEvent
+    from qtpy.QtGui import QCloseEvent, QPaintEvent, QShowEvent
 
 
 #: The settings tabs, in order: ``(config-ish key, icon name, label key)``.
@@ -1446,6 +1446,17 @@ class MainWindow(BaseWindow):
         self._lut3d_init_input_profiles()
         self.update_controls()
         self._apply_initial_geometry()
+        self._madtpg_timer = QTimer(self)
+        self._madtpg_timer.timeout.connect(self._refresh_madtpg_displays)
+        self._madtpg_timer.start(1000)
+        Application.register_exitfunc(self.worker.stop_madtpg_discovery)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        """Stop background discovery when the main window closes."""
+        super().closeEvent(event)
+        if event.isAccepted():
+            self._madtpg_timer.stop()
+            self.worker.stop_madtpg_discovery()
 
     # -- UI construction ---------------------------------------------------
 
@@ -3281,8 +3292,7 @@ class MainWindow(BaseWindow):
             or (
                 display_name == "madVR"
                 and (
-                    sys.platform != "win32"
-                    or not getcfg("madtpg.native")
+                    self.worker.uses_madtpg_network()
                     or bool(self.worker.argyll_virtual_display)
                 )
             )
@@ -5057,7 +5067,9 @@ class MainWindow(BaseWindow):
             and not update_cal
         )
 
-        has_devices = bool(self.worker.displays) and bool(self.worker.instruments)
+        has_devices = (
+            self.display_ctrl.currentIndex() >= 0 and bool(self.worker.instruments)
+        )
         not_ccxx = not config.is_ccxx_testchart()
 
         self.calibrate_btn.setVisible(calibrate_show)
@@ -5077,16 +5089,25 @@ class MainWindow(BaseWindow):
         self._update_measurement_report_btn_enabled()
 
     def update_displays(self) -> None:
-        """Populate the display selector from ``worker.displays``."""
-        self.display_ctrl.clear()
-        self.display_ctrl.addItems(display_items(self.worker.displays))
-        self.display_ctrl.setEnabled(bool(self.worker.displays))
-        if self.worker.displays:
-            index = min(
-                max(0, len(self.worker.displays) - 1),
-                max(0, getcfg("display.number") - 1),
-            )
-            self.display_ctrl.setCurrentIndex(index)
+        """Show displays and discovered peers while preserving canonical indices."""
+        self.worker.start_madtpg_discovery()
+        self._display_choices = self.worker.display_choices()
+        blocked = self.display_ctrl.blockSignals(True)
+        try:
+            self.display_ctrl.clear()
+            self.display_ctrl.addItems([choice[0] for choice in self._display_choices])
+            self.display_ctrl.setEnabled(bool(self._display_choices))
+            if self.worker.displays:
+                self.display_ctrl.setCurrentIndex(
+                    self.worker.selected_display_choice(self._display_choices)
+                )
+        finally:
+            self.display_ctrl.blockSignals(blocked)
+
+    def _refresh_madtpg_displays(self) -> None:
+        """Apply discovery changes on the GUI thread without changing selection."""
+        if self.worker.display_choices() != self._display_choices:
+            self.update_displays()
 
     def update_comports(self) -> None:
         """Populate the instrument selector from ``worker.instruments``."""
@@ -5233,7 +5254,9 @@ class MainWindow(BaseWindow):
 
         target = None
         if linked:
-            target = self.display_ctrl.currentText()
+            number = getcfg("display.number")
+            if 0 < number <= len(names):
+                target = names[number - 1]
         else:
             number = getcfg("display_lut.number")
             if 0 < number <= len(names):
@@ -5992,10 +6015,14 @@ class MainWindow(BaseWindow):
         """
         if self._updating or index < 0:
             return
-        setcfg("display.number", index + 1)
+        if index >= len(self._display_choices):
+            return
+        self.worker.select_display_choice(self._display_choices[index])
         if self.display_lut_link_ctrl.isVisibleTo(self):
             self.display_lut_link_ctrl_handler(self.display_lut_link_ctrl.isChecked())
         self._update_edid_menu_state()
+        self._update_advanced_options_visibility()
+        self._update_action_buttons()
 
     def comport_ctrl_handler(self, index: int) -> None:
         """Persist the selected instrument (comport) number.
@@ -6053,7 +6080,14 @@ class MainWindow(BaseWindow):
             not checked and self.display_lut_ctrl.count() > 0
         )
         if checked:
-            index = self.display_lut_ctrl.findText(self.display_ctrl.currentText())
+            # A discovered peer's friendly label still refers to generic madVR.
+            labels = display_items(self.worker.displays)
+            canonical = getcfg("display.number") - 1
+            index = (
+                self.display_lut_ctrl.findText(labels[canonical])
+                if 0 <= canonical < len(labels)
+                else -1
+            )
             if index >= 0:
                 self.display_lut_ctrl.setCurrentIndex(index)
         if self._updating:

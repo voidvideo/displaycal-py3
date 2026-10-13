@@ -2105,6 +2105,9 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
         self.restore_measurement_mode()
         self.restore_testchart()
         self.update_controls(update_ccmx_items=False)
+        self._madtpg_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._refresh_madtpg_displays, self._madtpg_timer)
+        self._madtpg_timer.Start(1000)
         scrollrate_x = 2 if self.calpanel.VirtualSize[0] > self.calpanel.Size[0] else 0
         self.calpanel.SetScrollRate(scrollrate_x, 2)
         x, y = getcfg("position.x", False), getcfg("position.y", False)
@@ -4488,8 +4491,10 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
                 item.replace("[PRIMARY]", lang.getstr("display.primary"))
             )
             self.displays[-1] = lang.getstr(self.displays[-1])
-        self.display_ctrl.SetItems(self.displays)
-        self.display_ctrl.Enable(bool(self.worker.displays))
+        self.worker.start_madtpg_discovery()
+        self._display_choices = self.worker.display_choices()
+        self.display_ctrl.SetItems([choice[0] for choice in self._display_choices])
+        self.display_ctrl.Enable(bool(self._display_choices))
         display_lut_sizer = self.display_ctrl.GetContainingSizer()
         display_sizer = self.display_lut_link_ctrl.GetContainingSizer()
         comport_sizer = self.comport_ctrl.GetContainingSizer()
@@ -4533,6 +4538,18 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
         self.Freeze()
         self.calpanel.SetVirtualSize(self.calpanel.GetBestVirtualSize())
         self.Thaw()
+
+    def _refresh_madtpg_displays(self, event: wx.Event) -> None:
+        """Refresh only dropdown rows, leaving calibration and display indices alone."""
+        choices = self.worker.display_choices()
+        if choices != self._display_choices:
+            self._display_choices = choices
+            self.display_ctrl.SetItems([choice[0] for choice in choices])
+            self.display_ctrl.Enable(bool(choices))
+            if choices:
+                self.display_ctrl.SetSelection(
+                    self.worker.selected_display_choice(choices)
+                )
 
     def update_comports(self, force: bool = False) -> None:
         """Update the comport selector control.
@@ -5217,6 +5234,7 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
             and calibrate_btn_show
             and not is_ccxx_testchart()
             and bool(self.worker.displays)
+            and self.display_ctrl.GetSelection() >= 0
             and bool(self.worker.instruments)
         )
         self.calibrate_and_profile_btn.Show(calibrate_and_profile_btn_show)
@@ -5224,12 +5242,14 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
             calibrate_and_profile_btn_show
             and not is_ccxx_testchart()
             and bool(self.worker.displays)
+            and self.display_ctrl.GetSelection() >= 0
             and bool(self.worker.instruments)
         )
         self.profile_btn.Show(profile_btn_show)
         self.profile_btn.Enable(
             profile_btn_show
             and bool(self.worker.displays)
+            and self.display_ctrl.GetSelection() >= 0
             and bool(self.worker.instruments)
         )
         self.lut3d_create_btn.Show(lut3d_create_btn_show)
@@ -11229,10 +11249,7 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
         debug_print("[D] get_set_display")
         if self.worker.displays:
             self.display_ctrl.SetSelection(
-                min(
-                    max(0, len(self.worker.displays) - 1),
-                    max(0, getcfg("display.number") - 1),
-                )
+                self.worker.selected_display_choice(self._display_choices)
             )
         self.display_ctrl_handler(
             CustomEvent(wx.EVT_CHOICE.evtType[0], self.display_ctrl),
@@ -13279,8 +13296,7 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
             or (
                 display_name == "madVR"
                 and (
-                    sys.platform != "win32"
-                    or not getcfg("madtpg.native")
+                    self.worker.uses_madtpg_network()
                     or bool(self.worker.argyll_virtual_display)
                 )
             )
@@ -15991,8 +16007,10 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
         )
         display_no = self.display_ctrl.GetSelection()
         profile = None
-        if display_no > -1:
-            setcfg("display.number", display_no + 1)
+        if 0 <= display_no < len(self._display_choices):
+            display_no = self.worker.select_display_choice(
+                self._display_choices[display_no]
+            )
             if load_lut:
                 profile = get_display_profile(display_no)
                 if not getcfg("calibration.file", False):
@@ -16168,7 +16186,7 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
             self.display_lut_link_ctrl.SetBitmapLabel(bitmap_link)
             with contextlib.suppress(ValueError):
                 lut_no = self.display_lut_ctrl.Items.index(
-                    self.display_ctrl.GetStringSelection()
+                    self.displays[getcfg("display.number") - 1]
                 )
         else:
             self.display_lut_link_ctrl.SetBitmapLabel(bitmap_unlink)
@@ -16176,7 +16194,7 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
         if lut_no < 0:
             try:
                 lut_no = self.display_lut_ctrl.Items.index(
-                    self.display_ctrl.Items[getcfg("display_lut.number") - 1]
+                    self.displays[getcfg("display_lut.number") - 1]
                 )
             except (IndexError, ValueError):
                 lut_no = min(0, self.display_ctrl.GetSelection())
@@ -20848,6 +20866,8 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
                 print("Waiting for child thread to exit...")
                 self.thread.join()
             self.listening = False
+            self._madtpg_timer.Stop()
+            self.worker.stop_madtpg_discovery()
             if isinstance(getattr(self.worker, "madtpg", None), madvr.MadTPGNet):
                 self.worker.madtpg.shutdown()
             for patterngenerator in list(self.worker.patterngenerators.values()):

@@ -20,6 +20,7 @@ import struct
 import sys
 import threading
 from binascii import unhexlify
+from dataclasses import dataclass
 from io import BytesIO, StringIO
 from time import sleep, time
 from typing import Any, BinaryIO, Callable, TextIO
@@ -1059,6 +1060,27 @@ class MadTPG(MadTPGBase):
         return self.dllpath
 
 
+@dataclass(frozen=True)
+class MadTPGInstance:
+    """A discovered process, independent of its current TCP connection."""
+
+    address: tuple[str, int]
+    process_id: int
+    module: int
+    instance: int
+    name: str
+
+    @property
+    def key(self) -> tuple[str, int, int, int]:
+        """Keep different hosts/processes distinct, including connect-back peers."""
+        return self.address[0], self.process_id, self.module, self.instance
+
+    @property
+    def label(self) -> str:
+        """Show the advertised name and IP address."""
+        return f"{self.name} — {self.address[0]}"
+
+
 class MadTPGNet(MadTPGBase):
     """Implementation of madVR network protocol in pure python.
 
@@ -1183,6 +1205,42 @@ class MadTPGNet(MadTPGBase):
         if event_name not in self._event_handlers:
             self._event_handlers[event_name] = []
         self._event_handlers[event_name].append(handler)
+
+    def discovered_instances(self) -> list[MadTPGInstance]:
+        """Snapshot confirmed generators without entering test-pattern mode."""
+        with _LOCK:
+            instances = {}
+            for addr, client in self.clients.items():
+                if client.get("component") != b"madTPG" or not client.get("confirmed"):
+                    continue
+                target = MadTPGInstance(
+                    addr,
+                    client["processId"],
+                    client["module"],
+                    client["instance"],
+                    client.get("exeDescr") or client.get("computerName") or "madVR",
+                )
+                instances[target.key] = target
+        return sorted(instances.values(), key=lambda item: (item.name, item.key))
+
+    def connect_to_instance(self, target: MadTPGInstance, timeout: int = 4000) -> bool:
+        """Activate only the selected process; never fall back to another peer."""
+        if not self.listening:
+            self.listen()
+        self.announce()
+        deadline = time() + timeout / 1000.0
+        while self.listening and time() < deadline:
+            for candidate in self.discovered_instances():
+                if candidate.key != target.key:
+                    continue
+                conn = self._client_sockets.get(candidate.address)
+                if self._client_socket and self._client_socket is not conn:
+                    self.disconnect()
+                return self._wait_for_client(
+                    candidate.address, max(0.001, deadline - time()), target=target
+                )
+            sleep(0.01)
+        return False
 
     def unbind(
         self, event_name: str, handler: None | Callable = None
@@ -1493,11 +1551,13 @@ class MadTPGNet(MadTPGBase):
                             )
                     else:
                         conn = self._get_client_socket(addr[0], c_port)
-                        threading.Thread(
+                        thread = threading.Thread(
                             target=self._connect,
                             name=f"madVR.ConnectToInstance[{addr[0]}:{c_port}]",
                             args=(conn, addr[0], c_port),
-                        ).start()
+                        )
+                        self._threads.append(thread)
+                        thread.start()
             else:
                 self._casts.remove(addr)
                 if self.debug:
@@ -1842,7 +1902,9 @@ class MadTPGNet(MadTPGBase):
                 for c_addr in self.clients:
                     c_client = self.clients[c_addr]
                     if (
-                        c_client.get("confirmed")
+                        c_addr[0] == addr[0]
+                        and c_client.get("instance") == client.get("instance")
+                        and c_client.get("confirmed")
                         and c_client["processId"] == client["processId"]
                         and c_client["module"] == client["module"]
                     ):
@@ -1878,10 +1940,12 @@ class MadTPGNet(MadTPGBase):
         self.clients[addr]["confirmed"] = True
         self._dispatch_event("on_client_confirmed", (addr, self.clients[addr]))
         # Close duplicate connections
-        for c_addr in self.clients:
+        for c_addr in list(self.clients):
             c_client = self.clients[c_addr]
             if (
                 c_addr != addr
+                and c_addr[0] == addr[0]
+                and c_client.get("instance") == client.get("instance")
                 and c_client["processId"] == client["processId"]
                 and c_client["module"] == client["module"]
             ):
@@ -2025,6 +2089,7 @@ class MadTPGNet(MadTPGBase):
         self,
         addr: None | tuple = None,
         timeout: float = 1,
+        target: MadTPGInstance | None = None,
     ) -> bool:
         """Wait for (first) madTPG client connection and handshake.
 
@@ -2032,6 +2097,8 @@ class MadTPGNet(MadTPGBase):
             addr (tuple): Optional address to wait for, if None, wait for any
                 client.
             timeout (float): Timeout in seconds to wait for the client.
+            target (MadTPGInstance | None): Require this exact discovered process
+                when activating a selected dropdown entry.
 
         Returns:
             bool: True if a madTPG client was found and the StartTestPattern
@@ -2045,7 +2112,18 @@ class MadTPGNet(MadTPGBase):
                 for c_addr in c_addrs:
                     client = clients.get(c_addr)
                     conn = self._client_sockets.get(c_addr)
-                    if not client and not conn:
+                    if not client or not conn:
+                        continue
+                    if (
+                        target
+                        and (
+                            c_addr[0],
+                            client["processId"],
+                            client["module"],
+                            client["instance"],
+                        )
+                        != target.key
+                    ):
                         continue
                     component_ = client["component"]
                     if not component_:

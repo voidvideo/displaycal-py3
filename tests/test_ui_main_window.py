@@ -84,6 +84,8 @@ def _init_config():
     never run.
     """
     config.initcfg()
+    # Selector tests start on the first display regardless of previous worker tests.
+    setcfg("display.number", 1)
     setcfg("3dlut.create", 0)
     setcfg("3dlut.format", "cube")
     setcfg("profile.black_point_compensation", 0)
@@ -144,6 +146,8 @@ def stub_worker(monkeypatch):
         self.instruments = ["i1 DisplayPro, ColorMunki Display", "Spyder5"]
 
     monkeypatch.setattr(Worker, "enumerate_displays_and_ports", fake)
+    # GUI unit tests supply discovery snapshots; never broadcast on the LAN.
+    monkeypatch.setattr(Worker, "start_madtpg_discovery", lambda self: None)
     # MainWindow embeds a measurement_report panel whose __init__ (via
     # mr_update_controls -> set_profile) unconditionally calls
     # config.get_current_profile(True), which falls through to
@@ -353,6 +357,96 @@ def test_selectors_populate_from_worker(window):
 def test_display_selection_persists_number(window):
     window.display_ctrl.setCurrentIndex(1)
     assert getcfg("display.number") == 2
+
+
+def test_madtpg_dropdown_selects_and_retains_exact_instance(window):
+    from DisplayCAL.madvr import MadTPGInstance
+
+    first = MadTPGInstance(("127.0.0.2", 60562), 100, 1, 0, "VoidVideo")
+    second = MadTPGInstance(("127.0.0.3", 60562), 100, 1, 0, "VoidVideo")
+    targets = [first, second]
+    window.worker.displays = ["Monitor", "madVR", "Resolve"]
+    setcfg("displays", window.worker.displays)
+    setcfg("display.number", 1)
+    window.worker._madtpg_discovery = SimpleNamespace(
+        discovered_instances=lambda: targets, shutdown=lambda: None
+    )
+    window.update_displays()
+
+    assert getcfg("display.number") == 1  # Filling the combo must not select a peer.
+    assert (window.display_ctrl.findText("madVR") >= 0) is (
+        sys.platform == "win32"
+    )
+    assert window.display_ctrl.count() == (5 if sys.platform == "win32" else 4)
+    window.display_ctrl.setCurrentIndex(window.display_ctrl.findText(second.label))
+    assert window.worker.madtpg_target == second
+    assert getcfg("display.number") == 2
+    assert config.get_display_name(None, True) == "madVR"
+
+    targets.reverse()
+    window._refresh_madtpg_displays()
+    assert window.display_ctrl.currentText() == second.label
+    assert window.worker.madtpg_target == second
+
+    targets.remove(second)
+    window._refresh_madtpg_displays()
+    assert second.label in window.display_ctrl.currentText()
+    assert lang.getstr("not_connected") in window.display_ctrl.currentText()
+    assert window.worker.madtpg_target == second
+
+    window.display_ctrl.setCurrentIndex(window.display_ctrl.findText("Resolve"))
+    assert window.worker.madtpg_target is None
+    assert getcfg("display.number") == 3
+    window.update_displays()
+    assert window.display_ctrl.currentText() == "Resolve"
+
+
+def test_madtpg_dropdown_keeps_lut_selection_on_canonical_display(window, monkeypatch):
+    from DisplayCAL.madvr import MadTPGInstance
+
+    monkeypatch.setattr(mw.sys, "platform", "linux")
+    target = MadTPGInstance(("127.0.0.2", 60562), 100, 1, 0, "VoidVideo")
+    window.worker.displays = ["Monitor", "madVR"]
+    window.worker.lut_access = [True, True]
+    setcfg("displays", window.worker.displays)
+    setcfg("use_separate_lut_access", 1)
+    setcfg("display_lut.link", 1)
+    window.worker._madtpg_discovery = SimpleNamespace(
+        discovered_instances=lambda: [target], shutdown=lambda: None
+    )
+    window.update_displays()
+    window.update_display_lut_ctrl()
+    window.display_ctrl.setCurrentIndex(window.display_ctrl.findText(target.label))
+    window.update_display_lut_ctrl()
+
+    assert window.display_ctrl.currentText() == target.label
+    assert window.display_lut_ctrl.currentText() == "madVR"
+    assert getcfg("display_lut.number") == 2
+
+
+def test_hidden_madtpg_selection_requires_explicit_device(window, monkeypatch):
+    monkeypatch.setattr(mw.sys, "platform", "linux")
+    window.worker.displays = ["Monitor", "madVR", "Resolve"]
+    setcfg("displays", window.worker.displays)
+    setcfg("display.number", 2)
+    window.update_displays()
+    window._update_action_buttons()
+
+    assert window.display_ctrl.findText("madVR") == -1
+    assert window.display_ctrl.currentIndex() == -1
+    assert not window.calibrate_btn.isEnabled()
+    assert not window.calibrate_and_profile_btn.isEnabled()
+    assert not window.profile_btn.isEnabled()
+    window.display_ctrl.setCurrentIndex(0)
+    assert getcfg("display.number") == 1
+    assert any(
+        button.isEnabled()
+        for button in (
+            window.calibrate_btn,
+            window.calibrate_and_profile_btn,
+            window.profile_btn,
+        )
+    )
 
 
 def test_comport_selection_persists_number(window):

@@ -2620,6 +2620,11 @@ class Worker(WorkerBase):
         self.lut_access = []
         self.paused = False
         self._patterngenerator_wait = False
+        self.madtpg_target: madvr.MadTPGInstance | None = None
+        self._madtpg_discovery: madvr.MadTPGNet | None = None
+        self._madtpg_discovery_lock = threading.Lock()
+        self._madtpg_discovery_stop = threading.Event()
+        self._madtpg_discovery_thread: threading.Thread | None = None
 
         self.send_buffer = None
         self.partial_data = ""
@@ -7034,7 +7039,7 @@ END_DATA
                 )
                 or (
                     config.get_display_name(None, True) == "madVR"
-                    and (sys.platform != "win32" or not getcfg("madtpg.native"))
+                    and self.uses_madtpg_network()
                 )
             )
             and cmdname == get_argyll_utilname("dispread")
@@ -13895,17 +13900,132 @@ BEGIN_DATA
             pauseable=True,
         )
 
+    def uses_madtpg_network(self) -> bool:
+        """Named instances use Python; the Windows madVR row uses the DLL."""
+        return self.madtpg_target is not None or sys.platform != "win32"
+
+    def _get_madtpg_network(self) -> madvr.MadTPGNet:
+        """Share discovery and calibration connections; call off the GUI thread."""
+        with self._madtpg_discovery_lock:
+            if self._madtpg_discovery is None:
+                self._madtpg_discovery = madvr.MadTPGNet()
+                self._madtpg_discovery.debug = VERBOSE
+            return self._madtpg_discovery
+
+    def start_madtpg_discovery(self) -> None:
+        """Discover in the background; no test-pattern commands are sent."""
+        if "madVR" not in self.displays:
+            return
+        if self._madtpg_discovery_thread and self._madtpg_discovery_thread.is_alive():
+            return
+        self._madtpg_discovery_stop.clear()
+
+        def discover() -> None:
+            try:
+                peer = self._get_madtpg_network()
+                while not self._madtpg_discovery_stop.is_set():
+                    if not peer.listening:
+                        peer.listen()
+                    peer.announce()
+                    self._madtpg_discovery_stop.wait(5)
+            except OSError as error:
+                self.log(f"madTPG discovery: {error}")
+
+        self._madtpg_discovery_thread = threading.Thread(
+            target=discover, name="madTPG.Discovery"
+        )
+        self._madtpg_discovery_thread.start()
+
+    def stop_madtpg_discovery(self) -> None:
+        """Retire discovery and its connections before the application exits."""
+        self._madtpg_discovery_stop.set()
+        if self._madtpg_discovery_thread:
+            self._madtpg_discovery_thread.join()
+            self._madtpg_discovery_thread = None
+        if self._madtpg_discovery:
+            self._madtpg_discovery.shutdown()
+
+    def display_choices(self) -> list[tuple[str, int, madvr.MadTPGInstance | None]]:
+        """Project discovery into both UIs without changing Argyll display indices.
+
+        Each row carries its label, canonical display index, and optional madTPG
+        instance. A lost selected instance stays visible and cannot silently
+        turn back into the generic Windows-native madVR choice.
+        """
+        choices = [
+            (
+                lang.getstr(name.replace("[PRIMARY]", lang.getstr("display.primary"))),
+                i,
+                None,
+            )
+            for i, name in enumerate(self.displays)
+            if name != "madVR" or sys.platform == "win32"
+        ]
+        if "madVR" not in self.displays:
+            return choices
+        index = self.displays.index("madVR")
+        targets = (
+            self._madtpg_discovery.discovered_instances()
+            if self._madtpg_discovery
+            else []
+        )
+        selected = self.madtpg_target
+        for target in targets:
+            choices.append((target.label, index, target))
+        if selected and all(target.key != selected.key for target in targets):
+            choices.append(
+                (f"{selected.label} ({lang.getstr('not_connected')})", index, selected)
+            )
+        return choices
+
+    def selected_display_choice(
+        self, choices: list[tuple[str, int, madvr.MadTPGInstance | None]]
+    ) -> int:
+        """Resolve persisted display number plus this session's selected instance."""
+        index = max(0, min(len(self.displays) - 1, getcfg("display.number") - 1))
+        for row, (_, display_index, target) in enumerate(choices):
+            if display_index != index:
+                continue
+            if target is None and (
+                self.displays[index] != "madVR" or self.madtpg_target is None
+            ):
+                return row
+            if (
+                target
+                and self.madtpg_target
+                and target.key == self.madtpg_target.key
+            ):
+                return row
+        # A saved generic madVR selection has no visible row outside Windows.
+        # Wait for an explicit selection instead of selecting another display.
+        return -1
+
+    def select_display_choice(
+        self, choice: tuple[str, int, madvr.MadTPGInstance | None]
+    ) -> int:
+        """Select a UI row while keeping the existing internal generator type."""
+        _, index, target = choice
+        self.madtpg_target = target
+        setcfg("display.number", index + 1)
+        if target:
+            setcfg("madtpg.host", target.address[0])
+            setcfg("madtpg.port", target.address[1])
+        return index
+
     def madtpg_init(self):
         """Initialize madTPG connection."""
-        if hasattr(self, "madtpg"):
-            return
-        if sys.platform == "win32" and getcfg("madtpg.native"):
+        network = self.uses_madtpg_network()
+        previous = getattr(self, "madtpg", None)
+        if previous is not None:
+            if isinstance(previous, madvr.MadTPGNet) == network:
+                return
+            previous.disconnect()
+        if not network:
             # Using native implementation (madHcNet32.dll)
             self.madtpg = madvr.MadTPG()
         else:
             # Using madVR net-protocol pure python implementation
-            self.madtpg = madvr.MadTPGNet()
-            self.madtpg.debug = VERBOSE
+            self.madtpg = self._get_madtpg_network()
 
     def madtpg_connect(self):
         """Connect to madTPG and check version.
@@ -13913,9 +14033,16 @@ BEGIN_DATA
         Returns:
             bool: True if connected successfully, False otherwise.
         """
+        if self.uses_madtpg_network() and self.madtpg_target is None:
+            return False
         self.madtpg_init()
         self.patterngenerator = self.madtpg
-        if self.madtpg.connect(method3=madvr.CM_StartLocalInstance, timeout3=3000):
+        connected = (
+            self.madtpg.connect_to_instance(self.madtpg_target)
+            if self.madtpg_target is not None
+            else self.madtpg.connect(method3=madvr.CM_StartLocalInstance, timeout3=3000)
+        )
+        if connected:
             # Check madVR version
             madvr_version = self.madtpg.get_version()
             if not madvr_version or madvr_version < madvr.MIN_VERSION:

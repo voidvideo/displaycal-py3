@@ -1,0 +1,50 @@
+{
+  "base_version": "3.9.17",
+  "scope": "madTPG discovery, explicit device selection, Windows native generic row, byte reply handling",
+  "source_commits": [
+    "90e76fe0",
+    "f06b8026",
+    "f333109a",
+    "fcced847"
+  ],
+  "adaptations": [
+    "Preserve stable MadTPG_Net names and receive loop",
+    "Preserve existing binary gamma-ramp serialization",
+    "Apply boolean byte-reply decoding",
+    "Backport wx only"
+  ],
+  "excluded": [
+    "Qt migration",
+    "Pyrefly and general function cleanup",
+    "launcher changes"
+  ],
+  "files": {
+    "DisplayCAL/madvr.py": {
+      "before_sha256": "61eb96b077db7dc0e78e8fe88348ed5bc0cd01f06f763419d30ae7629bd5ace9",
+      "after_sha256": "bd21d2be7af2416d8af7ef3e2b3ce118b9ad05844c4ba29531ac34669b7a14d9"
+    },
+    "DisplayCAL/worker.py": {
+      "before_sha256": "4547d37bd8d7c5deb0d69cbc2c3e373df0bac7a2d3eae3b97843c4f3ed3c53ff",
+      "after_sha256": "b4b51d49b2a3c468e1028dcf0e4b507dcd68649de6bfdc1619921f68d670e994"
+    },
+    "DisplayCAL/display_cal.py": {
+      "before_sha256": "e6e6772de660ad0362732243d4d78f418a62a71d198a7408c69f3f47bd0d6833",
+      "after_sha256": "12373226a200009faee42ced985db14deeb29efa1350b10cce07fc047ef5f385"
+    }
+  },
+  "validation": {
+    "python": "3.11.13",
+    "tests_passed": 28,
+    "tests": [
+      "test_madvr.py",
+      "test_madvr_discovery.py",
+      "test_madvr_wx_discovery.py"
+    ],
+    "test_adaptations": [
+      "Stable MadTPG_Net/min_version/cfg names",
+      "Use stable _process for duplicate-peer test"
+    ],
+    "live_discovery": "VoidVideo calibration display on 192.168.1.111; no StartTestPattern",
+    "calibration_run": false
+  }
+}

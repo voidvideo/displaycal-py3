@@ -151,10 +151,16 @@ def test_worker_madtpg_measurement_setup(
     peer.get_black_and_white_level.return_value = (0, 255)
     peer.get_pattern_config.return_value = (10, 0, 0, 0)
     failure = OSError("connection failed")
+    connection = peer.connect_to_instance if network else peer.connect
     if connect_error:
-        peer.connect.side_effect = failure
+        connection.side_effect = failure
     worker = Worker()
     worker.madtpg = peer
+    monkeypatch.setattr(worker, "uses_madtpg_network", lambda: network)
+    if network:
+        worker.madtpg_target = madvr.MadTPGInstance(
+            ("127.0.0.2", 60562), 100, 1, 0, "madTPG"
+        )
     worker.instrument_on_screen = True
     worker.argyll_virtual_display = "dummy" if network else None
     worker.argyll_version = [3, 3, 0]
